@@ -16,13 +16,11 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
-import open3d as o3d
 from rich import print
 import roma
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-import wandb
 import matplotlib
 
 matplotlib.use("Agg")
@@ -160,6 +158,8 @@ def setup_experiment(config: Config, argv=None, debug_mode: bool = False):
         os.makedirs(log_path, access, exist_ok=True)
 
         if config.wandb_vis_on:
+            import wandb
+
             # set up wandb
             setup_wandb()
             wandb.init(
@@ -193,7 +193,6 @@ def seed_anything(seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    o3d.utility.random.seed(seed)
 
 
 def remove_gpu_cache():
@@ -379,6 +378,8 @@ def load_decoders(loaded_model, mlp_dict, freeze_decoders: bool = True):
 
 
 def create_bbx_o3d(center, half_size):
+    import open3d as o3d
+
     return o3d.geometry.AxisAlignedBoundingBox(center - half_size, center + half_size)
 
 
@@ -467,6 +468,8 @@ def color_to_intensity(colors: torch.tensor):
 
 
 def create_axis_aligned_bounding_box(center, size):
+    import open3d as o3d
+
     # Calculate the min and max coordinates based on the center and size
     min_coords = center - (size / 2)
     max_coords = center + (size / 2)
@@ -574,6 +577,8 @@ def torch2o3d(points_torch):
     """
     Convert a batch of points from torch to o3d
     """
+    import open3d as o3d
+
     pc_o3d = o3d.geometry.PointCloud()
     points_np = points_torch.cpu().detach().numpy().astype(np.float64)
     pc_o3d.points = o3d.utility.Vector3dVector(points_np)
@@ -725,14 +730,12 @@ def voxel_down_sample_min_value_torch(
 
 
 # split a large point cloud into bounding box chunks
-def split_chunks(
-    pc: o3d.geometry.PointCloud(),
-    aabb: o3d.geometry.AxisAlignedBoundingBox(),
-    chunk_m: float = 100.0,
-):
+def split_chunks(pc, aabb, chunk_m: float = 100.0):
     """
     Split a large point cloud into bounding box chunks
     """
+    import open3d as o3d
+
     if not pc.has_points():
         return None
 

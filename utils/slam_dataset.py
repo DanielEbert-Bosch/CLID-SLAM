@@ -10,11 +10,10 @@ import math
 import os
 import sys
 import torch
-import wandb
 import matplotlib.cm as cm
 import numpy as np
-import open3d as o3d
 import pandas as pd
+from plyfile import PlyData
 from numpy.linalg import inv
 from pathlib import Path
 from typing import List
@@ -184,13 +183,13 @@ class SLAMDataset(Dataset):
             self.color_scale = 1.0
 
         # current frame point cloud (for visualization)
-        self.cur_frame_o3d = o3d.geometry.PointCloud()
+        self.cur_frame_o3d = None
         # current frame bounding box in the world coordinate system
-        self.cur_bbx = o3d.geometry.AxisAlignedBoundingBox()
+        self.cur_bbx = None
         # merged downsampled point cloud (for visualization)
-        self.map_down_o3d = o3d.geometry.PointCloud()
+        self.map_down_o3d = None
         # map bounding box in the world coordinate system
-        self.map_bbx = o3d.geometry.AxisAlignedBoundingBox()
+        self.map_bbx = None
 
         self.static_mask = None
 
@@ -582,6 +581,8 @@ class SLAMDataset(Dataset):
         self.pgo_poses[: self.processed_frame + 1] = pgo_poses  # update pgo pose
 
     def update_o3d_map(self):
+        import open3d as o3d
+
         frame_down_torch = self.cur_point_cloud_torch  # no futher downsample
         # 创建一个空的open3d点云对象，用于存储和操作三维点云数据
         frame_o3d = o3d.geometry.PointCloud()
@@ -662,24 +663,8 @@ class SLAMDataset(Dataset):
         # use the downsampled neural points here (done outside the class)
 
     def write_results_log(self):
-        log_folder = "log"
-        frame_str = str(self.processed_frame)
-
-        if self.config.track_on:
-            write_traj_as_o3d(
-                self.odom_poses[: self.processed_frame + 1],
-                os.path.join(self.run_path, log_folder, frame_str + "_odom_poses.ply"),
-            )
-        if self.config.pgo_on:
-            write_traj_as_o3d(
-                self.pgo_poses[: self.processed_frame + 1],
-                os.path.join(self.run_path, log_folder, frame_str + "_slam_poses.ply"),
-            )
-        if self.gt_pose_provided:
-            write_traj_as_o3d(
-                self.gt_poses[: self.processed_frame + 1],
-                os.path.join(self.run_path, log_folder, frame_str + "_gt_poses.ply"),
-            )
+        # Optional trajectory PLY logging disabled; KITTI and TUM outputs are sufficient.
+        pass
 
     def get_poses_np_for_vis(self):
         odom_poses = None
@@ -703,7 +688,8 @@ class SLAMDataset(Dataset):
         write_tum_format_poses(
             os.path.join(self.run_path, "odom_poses"), odom_poses_out, self.poses_ts
         )
-        write_traj_as_o3d(odom_poses, os.path.join(self.run_path, "odom_poses.ply"))
+        # Optional trajectory PLY export disabled; KITTI and TUM outputs are sufficient.
+        # write_traj_as_o3d(odom_poses, os.path.join(self.run_path, "odom_poses.ply"))
 
         if self.config.pgo_on:
             pgo_poses = self.pgo_poses[: self.processed_frame + 1]
@@ -717,7 +703,7 @@ class SLAMDataset(Dataset):
                 self.poses_ts,
                 0.1 * self.config.step_frame,
             )
-            write_traj_as_o3d(pgo_poses, os.path.join(self.run_path, "slam_poses.ply"))
+            # write_traj_as_o3d(pgo_poses, os.path.join(self.run_path, "slam_poses.ply"))
 
         # timing report
         time_table = np.array(self.time_table)
@@ -740,7 +726,7 @@ class SLAMDataset(Dataset):
         # pose estimation evaluation report
         if self.gt_pose_provided:
             gt_poses = self.gt_poses[: self.processed_frame + 1]
-            write_traj_as_o3d(gt_poses, os.path.join(self.run_path, "gt_poses.ply"))
+            # write_traj_as_o3d(gt_poses, os.path.join(self.run_path, "gt_poses.ply"))
 
             print("Odometry evaluation:")
             avg_tra, avg_rot = relative_error(gt_poses, odom_poses)
@@ -757,6 +743,8 @@ class SLAMDataset(Dataset):
                 print("Absoulte Trajectory Error       (m):", f"{ate_trans:.3f}")
 
             if self.config.wandb_vis_on:
+                import wandb
+
                 wandb_log_content = {
                     "Average Translation Error [%]": avg_tra,
                     "Average Rotational Error [deg/m]": avg_rot,
@@ -788,6 +776,8 @@ class SLAMDataset(Dataset):
                     )
 
                 if self.config.wandb_vis_on:
+                    import wandb
+
                     wandb_log_content = {
                         "SLAM Average Translation Error [%]": avg_tra_slam,
                         "SLAM Average Rotational Error [deg/m]": avg_rot_slam,
@@ -880,6 +870,8 @@ class SLAMDataset(Dataset):
         return pose_eval
 
     def write_merged_point_cloud(self):
+        import open3d as o3d
+
         print("Begin to replay the dataset ...")
 
         # 初始化Open3D的计算设备和数据类型
@@ -1012,29 +1004,30 @@ def read_point_cloud(
             ts = points[:, -1]
 
     elif ".ply" in filename:
-        pc_load = o3d.t.io.read_point_cloud(filename)
-        pc_load = {k: v.numpy() for k, v in pc_load.point.items()}
+        vertex = PlyData.read(filename)["vertex"].data
+        properties = set(vertex.dtype.names or ())
+        points = np.column_stack((vertex["x"], vertex["y"], vertex["z"]))
 
-        keys = list(pc_load.keys())
-        # print("available attributes:", keys)
-
-        points = pc_load["positions"]
-
-        if "t" in keys:
-            ts = pc_load["t"] * 1e-8
-        elif "timestamp" in keys:
-            ts = pc_load["timestamp"]
+        if "t" in properties:
+            ts = np.asarray(vertex["t"]) * 1e-8
+        elif "timestamp" in properties:
+            ts = np.asarray(vertex["timestamp"])
         else:
             ts = None
 
-        if "colors" in keys and color_channel == 3:
-            colors = pc_load["colors"]  # if they are available
+        if {"red", "green", "blue"} <= properties and color_channel == 3:
+            colors = np.column_stack(
+                (vertex["red"], vertex["green"], vertex["blue"])
+            )
+            if np.issubdtype(colors.dtype, np.integer):
+                colors = colors.astype(np.float64) / np.iinfo(colors.dtype).max
             points = np.hstack((points, colors))
-        elif "intensity" in keys and color_channel == 1:
-            intensity = pc_load["intensity"]  # if they are available
-            # print(intensity)
+        elif "intensity" in properties and color_channel == 1:
+            intensity = np.asarray(vertex["intensity"]).reshape(-1, 1)
             points = np.hstack((points, intensity))
     elif ".pcd" in filename:  # currently cannot be readed by o3d.t.io
+        import open3d as o3d
+
         pc_load = o3d.io.read_point_cloud(filename)
         points = np.asarray(pc_load.points, dtype=np.float64)
         ts = None
@@ -1318,6 +1311,8 @@ def filter_sem_kitti(
 
 
 def write_traj_as_o3d(poses_np, path):
+    import open3d as o3d
+
     """
     将位姿列表转换为 Open3D 点云格式并保存
 

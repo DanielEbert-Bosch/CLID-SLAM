@@ -12,14 +12,11 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import sys
 import time
 import numpy as np
-import open3d as o3d
 import torch
 import torch.multiprocessing as mp
-import wandb
+from plyfile import PlyData, PlyElement
 from rich import print
 from tqdm import tqdm
-from gui import slam_gui
-from gui.gui_utils import ParamsGUI, VisPacket, ControlPacket, get_latest_queue
 from model.decoder import Decoder
 from model.local_point_cloud_map import LocalPointCloudMap
 from model.neural_points import NeuralPoints
@@ -27,7 +24,6 @@ from utils.config import Config
 from utils.dataset_indexing import set_dataset_path
 from utils.error_state_iekf import IEKFOM
 from utils.mapper import Mapper
-from utils.mesher import Mesher
 from utils.slam_dataset import SLAMDataset
 from utils.tools import (
     freeze_model,
@@ -92,13 +88,20 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
     mapper = Mapper(config, dataset, neural_points, local_point_cloud_map, geo_mlp)
 
     # 网格重建
-    mesher = Mesher(config, neural_points, mlp_dict)
+    mesher = None
+    if config.o3d_vis_on or config.save_mesh:
+        from utils.mesher import Mesher
+
+        mesher = Mesher(config, neural_points, mlp_dict)
 
     last_frame = dataset.total_pc_count - 1
 
     # 可视化
     q_main2vis = q_vis2main = None
     if config.o3d_vis_on:
+        from gui import slam_gui
+        from gui.gui_utils import ParamsGUI, VisPacket, ControlPacket, get_latest_queue
+
         # communicator between the processes
         q_main2vis = mp.Queue()
         q_vis2main = mp.Queue()
@@ -377,6 +380,8 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
         dataset.time_table.append(cur_frame_process_time)  # in s
 
         if config.wandb_vis_on:
+            import wandb
+
             wandb_log_content = {
                 "frame": frame_id,
                 "timing(s)/preprocess": T2 - T1,
@@ -398,16 +403,37 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
     neural_points.recreate_hash(
         None, None, False, False
     )  # merge the final neural point map
-    neural_pcd = neural_points.get_neural_points_o3d(query_global=True, color_mode=0)
+    neural_point_positions, neural_point_colors = neural_points.get_neural_points_data(
+        query_global=True, color_mode=0
+    )
     if config.save_map:
-        o3d.io.write_point_cloud(
-            os.path.join(run_path, "map", "neural_points.ply"), neural_pcd
-        )  # write the neural point cloud
+        vertex_data = {
+            "x": neural_point_positions[:, 0].astype(np.float32),
+            "y": neural_point_positions[:, 1].astype(np.float32),
+            "z": neural_point_positions[:, 2].astype(np.float32),
+        }
+        if neural_point_colors is not None:
+            colors = np.clip(neural_point_colors * 255.0, 0, 255).astype(np.uint8)
+            vertex_data.update(
+                {"red": colors[:, 0], "green": colors[:, 1], "blue": colors[:, 2]}
+            )
+        vertices = np.empty(
+            len(neural_point_positions),
+            dtype=[(name, values.dtype) for name, values in vertex_data.items()],
+        )
+        for name, values in vertex_data.items():
+            vertices[name] = values
+        PlyData([PlyElement.describe(vertices, "vertex")], text=False).write(
+            os.path.join(run_path, "map", "neural_points.ply")
+        )
     neural_points.clear_temp()  # clear temp data for output
 
     output_mc_res_m = config.mc_res_m * 0.6
     mc_cm_str = str(round(output_mc_res_m * 1e2))
     if config.save_mesh:
+        neural_pcd = neural_points.get_neural_points_o3d(
+            query_global=True, color_mode=0
+        )
         chunks_aabb = split_chunks(
             neural_pcd,
             neural_pcd.get_axis_aligned_bounding_box(),

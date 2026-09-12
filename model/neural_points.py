@@ -6,7 +6,6 @@
 import sys
 import matplotlib.cm as cm
 import numpy as np
-import open3d as o3d
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -187,13 +186,12 @@ class NeuralPoints(nn.Module):
                 project_data=False,
             )
 
-    def get_neural_points_o3d(
+    def get_neural_points_data(
         self,
         query_global: bool = True,
         color_mode: int = -1,
         random_down_ratio: int = 1,
-    ):
-        ratio_vis = 1.5
+    ) -> tuple[np.ndarray, np.ndarray | None]:
         # TODO: visualize orientation as normal
 
         if query_global:
@@ -214,9 +212,7 @@ class NeuralPoints(nn.Module):
                 .astype(np.float64)
             )
 
-        # neural_points_np = self.neural_points[::random_down_ratio].cpu().detach().numpy().astype(np.float64)
-        neural_pc_o3d = o3d.geometry.PointCloud()
-        neural_pc_o3d.points = o3d.utility.Vector3dVector(neural_points_np)
+        colors = None
 
         if color_mode == 0 and (self.geo_feature_pca is not None):  # "geo_feature"
             if query_global:
@@ -230,7 +226,7 @@ class NeuralPoints(nn.Module):
                 neural_features_vis, principal_components=self.geo_feature_pca
             )  # [0,1]
             geo_feature_rgb = geo_feature_3d.cpu().numpy().astype(np.float64)
-            neural_pc_o3d.colors = o3d.utility.Vector3dVector(geo_feature_rgb)
+            colors = geo_feature_rgb
 
             # neural_features_vis = F.normalize(neural_features_vis, p=2, dim=1)
             # neural_features_np = neural_features_vis.cpu().numpy().astype(np.float64)
@@ -254,7 +250,7 @@ class NeuralPoints(nn.Module):
                 neural_features_vis, principal_components=self.color_feature_pca
             )  # [0,1]
             color_feature_rgb = color_feature_3d.cpu().numpy().astype(np.float64)
-            neural_pc_o3d.colors = o3d.utility.Vector3dVector(color_feature_rgb)
+            colors = color_feature_rgb
 
             # neural_features_vis = F.normalize(neural_features_vis, p=2, dim=1)
             # neural_features_np = neural_features_vis.cpu().numpy().astype(np.float64)
@@ -286,7 +282,7 @@ class NeuralPoints(nn.Module):
             ts_np = np.clip(ts_np / self.max_ts, 0.0, 1.0)
             color_map = cm.get_cmap("jet")
             ts_color = color_map(ts_np)[:, :3].astype(np.float64)
-            neural_pc_o3d.colors = o3d.utility.Vector3dVector(ts_color)
+            colors = ts_color
 
         elif color_mode == 3:  # "certainty" # certainty as color
             if query_global:
@@ -311,15 +307,32 @@ class NeuralPoints(nn.Module):
                 )
             # print(self.local_point_certainties)
             certainty_color = np.repeat(certainty_np.reshape(-1, 1), 3, axis=1)
-            neural_pc_o3d.colors = o3d.utility.Vector3dVector(certainty_color)
+            colors = certainty_color
 
         elif color_mode == 4:  # "random" # random color
             random_color = np.random.rand(neural_points_np.shape[0], 3).astype(
                 np.float64
             )
-            neural_pc_o3d.colors = o3d.utility.Vector3dVector(random_color)
+            colors = random_color
 
-        return neural_pc_o3d
+        return neural_points_np, colors
+
+    def get_neural_points_o3d(
+        self,
+        query_global: bool = True,
+        color_mode: int = -1,
+        random_down_ratio: int = 1,
+    ):
+        import open3d as o3d
+
+        points, colors = self.get_neural_points_data(
+            query_global, color_mode, random_down_ratio
+        )
+        point_cloud = o3d.geometry.PointCloud()
+        point_cloud.points = o3d.utility.Vector3dVector(points)
+        if colors is not None:
+            point_cloud.colors = o3d.utility.Vector3dVector(colors)
+        return point_cloud
 
     def update(
         self,
@@ -1081,6 +1094,8 @@ class NeuralPoints(nn.Module):
         map_max, _ = torch.max(self.neural_points, dim=0)
 
         # print(map_min)
+
+        import open3d as o3d
 
         o3d_bbx = o3d.geometry.AxisAlignedBoundingBox(
             map_min.cpu().detach().numpy(), map_max.cpu().detach().numpy()

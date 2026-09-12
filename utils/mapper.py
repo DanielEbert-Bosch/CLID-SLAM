@@ -9,10 +9,8 @@
 import math
 import sys
 import torch
-import wandb
 import matplotlib.cm as cm
 import numpy as np
-import open3d as o3d
 import torch.nn.functional as F
 from rich import print
 from tqdm import tqdm
@@ -551,6 +549,8 @@ class Mapper:
 
     # for visualization
     def get_data_pool_o3d(self, down_rate=1, only_cur_data=False):
+        import open3d as o3d
+
         if only_cur_data:
             pool_coord_np = (
                 self.global_coord_pool[-self.cur_sample_count :: 3]
@@ -847,6 +847,8 @@ class Mapper:
             # print("time for back propogation:", (T05-T04) * 1e3) # \\\\\\
 
             if self.config.wandb_vis_on:
+                import wandb
+
                 wandb_log_content = {
                     "iter": self.total_iter,
                     "loss/total_loss": cur_loss,
