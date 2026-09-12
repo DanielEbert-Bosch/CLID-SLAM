@@ -7,6 +7,7 @@
 # Copyright (c) 2025 Junlong Jiang, all rights reserved.
 
 import math
+from pathlib import Path
 import sys
 import torch
 import matplotlib.cm as cm
@@ -27,6 +28,7 @@ from utils.tools import (
     setup_optimizer,
     transform_batch_torch,
     transform_torch,
+    write_binary_xyz_pcd,
 )
 
 
@@ -96,7 +98,7 @@ class Mapper:
 
     def dynamic_filter(self, points_torch, type_2_on: bool = True):
         if type_2_on:
-            points_torch.requires_grad_(True)
+            points_torch = points_torch.detach().clone().requires_grad_(True)
 
         geo_feature, _, weight_knn, _, certainty = self.neural_points.query_feature(
             points_torch, training_mode=False
@@ -157,6 +159,7 @@ class Mapper:
     def process_frame(
         self,
         point_cloud_torch: torch.tensor,
+        point_origin_torch: torch.tensor,
         frame_label_torch: torch.tensor,
         cur_pose_torch: torch.tensor,
         frame_id: int,
@@ -200,6 +203,7 @@ class Mapper:
             if not self.silence:
                 print("# Dynamic points filtered: ", dynamic_count)
             frame_point_torch = frame_point_torch[self.static_mask]
+            point_origin_torch = point_origin_torch[self.static_mask]
 
         frame_color_torch = None
         if self.config.color_on:
@@ -210,6 +214,16 @@ class Mapper:
         if frame_label_torch is not None:
             if filter_dynamic:
                 frame_label_torch = frame_label_torch[self.static_mask]
+
+        if self.config.corrected_frame_dir:
+            corrected_frame_points = self.dataset.corrected_frame_point_cloud_torch
+            frame_point_torch_global = transform_torch(
+                corrected_frame_points, cur_pose_torch
+            )
+            write_binary_xyz_pcd(
+                Path(self.config.corrected_frame_dir) / f"{frame_id:06d}.pcd",
+                frame_point_torch_global.detach().cpu().numpy(),
+            )
 
         frame_normal_torch = None  # not used yet
 
@@ -230,6 +244,7 @@ class Mapper:
                 weight,
             ) = self.sampler.sample_pin(
                 frame_point_torch,
+                point_origin_torch,
                 frame_normal_torch,
                 frame_label_torch,
                 frame_color_torch,
@@ -239,7 +254,10 @@ class Mapper:
             # The proposed region-specific SDF estimation method
             normal_label, sem_label, color_label = None, None, None
             (coord, sdf_label, weight) = self.sampler.sample(
-                frame_point_torch, self.local_point_cloud_map, cur_pose_torch
+                frame_point_torch,
+                point_origin_torch,
+                self.local_point_cloud_map,
+                cur_pose_torch,
             )
 
         ##################################### Changed By Jiang Junlong #################################################

@@ -13,7 +13,9 @@ class DataSampler:
         self.config = config
         self.dev = config.device
 
-    def sample_pin(self, points_torch, normal_torch, sem_label_torch, color_torch):
+    def sample_pin(
+        self, points_torch, point_origins_torch, normal_torch, sem_label_torch, color_torch
+    ):
         """
         Sample training sample points for current scan, get the labels for online training
         input and output are all torch tensors
@@ -35,8 +37,9 @@ class DataSampler:
 
         # get sample points
         point_num = points_torch.shape[0]
+        ray_vectors = points_torch - point_origins_torch
         distances = torch.linalg.norm(
-            points_torch, dim=1, keepdim=True
+            ray_vectors, dim=1, keepdim=True
         )  # ray distances (scaled)
 
         # Part 0. the exact measured point
@@ -129,9 +132,10 @@ class DataSampler:
             0,
         )
 
-        repeated_points = points_torch.repeat(all_sample_n, 1)
+        repeated_origins = point_origins_torch.repeat(all_sample_n, 1)
+        repeated_rays = ray_vectors.repeat(all_sample_n, 1)
         repeated_dist = distances.repeat(all_sample_n, 1)
-        all_sample_points = repeated_points * all_sample_dist_ratio
+        all_sample_points = repeated_origins + repeated_rays * all_sample_dist_ratio
 
         # depth tensor of all the samples
         depths_tensor = repeated_dist * all_sample_dist_ratio
@@ -258,7 +262,11 @@ class DataSampler:
         )
 
     def sample(
-        self, points_torch, local_point_cloud_map: LocalPointCloudMap, cur_pose_torch
+        self,
+        points_torch,
+        point_origins_torch,
+        local_point_cloud_map: LocalPointCloudMap,
+        cur_pose_torch,
     ):
         dev = self.dev
         surface_sample_range = self.config.surface_sample_range_m
@@ -273,8 +281,9 @@ class DataSampler:
 
         # get sample points
         point_num = points_torch.shape[0]
+        ray_vectors = points_torch - point_origins_torch
         distances = torch.linalg.norm(
-            points_torch, dim=1, keepdim=True
+            ray_vectors, dim=1, keepdim=True
         )  # ray distances (scaled)
 
         # Part 0. the exact measured point
@@ -346,9 +355,10 @@ class DataSampler:
             0,
         )
 
-        repeated_points = points_torch.repeat(all_sample_n, 1)
+        repeated_origins = point_origins_torch.repeat(all_sample_n, 1)
+        repeated_rays = ray_vectors.repeat(all_sample_n, 1)
         repeated_dist = distances.repeat(all_sample_n, 1)
-        all_sample_points = repeated_points * all_sample_dist_ratio
+        all_sample_points = repeated_origins + repeated_rays * all_sample_dist_ratio
         ####################################### Added By Jiang Junlong #################################################
         # 根据表面采样平移量计算符号
         sdf_sign = torch.where(surface_sample_displacement.squeeze(1) < 0, 1, -1)

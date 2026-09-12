@@ -23,8 +23,10 @@ class Config:
         self.output_root: str = ""  # output root folder
         self.pc_path: str = ""  # input point cloud folder
         self.imu_path: str = ""  # input imu data folder
+        self.vme_path: str = ""  # optional per-frame vehicle motion estimate folder
         self.pose_ts_path: str = ""  # input pose timestamp folder
         self.pose_path: str = ""  # input pose file
+        self.corrected_frame_dir: str = ""  # optional per-frame mapping cloud output
         self.calib_path: str = ""  # input calib file (to sensor frame), optional
         self.label_path: str = (
             ""  # input point-wise label path, for semantic mapping (optional)
@@ -280,6 +282,27 @@ class Config:
         )
         self.measurement_noise_covariance: float = 0.01
         self.bias_noise_covariance: float = 0.0001
+        self.imu_noise_density_on: bool = False
+        self.vel_process_noise_mps_per_sqrt_s: float = 0.15
+        self.vme_on: bool = False
+        self.vme_vel_noise: float = 0.05  # longitudinal velocity standard deviation [m/s]
+        self.vme_nhc_noise: float = 0.1  # lateral/vertical NHC standard deviation [m/s]
+        self.vme_yawrate_on: bool = False
+        self.vme_yawrate_noise: float = 0.05  # yaw-rate standard deviation [rad/s]
+        self.reg_information_cap_on: bool = False
+        self.degeneracy_lever_arm_m: float = 10.0
+        self.reg_position_sigma_m: float = 0.02
+        self.vme_scale_on: bool = False
+        self.vme_scale_random_walk: float = 1e-4  # per sqrt(second)
+        self.vme_scale_init_sigma: float = 0.02
+        self.vme_scale_min: float = 0.95
+        self.vme_scale_max: float = 1.05
+        self.vme_scale_min_speed_mps: float = 0.1
+        # Minimum previous-frame normalized capped longitudinal LiDAR information.
+        self.vme_scale_min_lidar_weight: float = 0.5
+        self.vme_scale_settle_frames: int = 50
+        self.vme_innovation_inflate_frames: int = 3
+        self.vme_velocity_recovery_sigma_mps: float = 0.15
 
         # loop closure detection
         self.global_loop_on: bool = (
@@ -423,6 +446,7 @@ class Config:
             )
             self.pc_path = config_args["setting"].get("pc_path", "")
             self.imu_path = config_args["setting"].get("imu_path", "")
+            self.vme_path = config_args["setting"].get("vme_path", "")
             self.pose_path = config_args["setting"].get("pose_path", "")
             self.pose_ts_path = config_args["setting"].get("pose_ts_path", "")
             self.calib_path = config_args["setting"].get("calib_path", "")
@@ -457,6 +481,9 @@ class Config:
             self.begin_frame = config_args["setting"].get("begin_frame", 0)
             self.end_frame = config_args["setting"].get("end_frame", self.end_frame)
             self.step_frame = config_args["setting"].get("step_frame", 1)
+            self.corrected_frame_dir = config_args["setting"].get(
+                "corrected_frame_dir", self.corrected_frame_dir
+            )
 
             self.seed = config_args["setting"].get("random_seed", self.seed)
             self.device = config_args["setting"].get(
@@ -737,6 +764,110 @@ class Config:
             self.bias_noise_covariance = config_args["tracker"].get(
                 "bias_noise_covariance", self.bias_noise_covariance
             )
+            self.imu_noise_density_on = config_args["tracker"].get(
+                "imu_noise_density_on", self.imu_noise_density_on
+            )
+            self.vel_process_noise_mps_per_sqrt_s = float(
+                config_args["tracker"].get(
+                    "vel_process_noise_mps_per_sqrt_s",
+                    self.vel_process_noise_mps_per_sqrt_s,
+                )
+            )
+            self.vme_on = config_args["tracker"].get("vme_on", self.vme_on)
+            self.vme_vel_noise = float(
+                config_args["tracker"].get("vme_vel_noise", self.vme_vel_noise)
+            )
+            self.vme_nhc_noise = float(
+                config_args["tracker"].get("vme_nhc_noise", self.vme_nhc_noise)
+            )
+            self.vme_yawrate_on = config_args["tracker"].get(
+                "vme_yawrate_on", self.vme_yawrate_on
+            )
+            self.vme_yawrate_noise = float(
+                config_args["tracker"].get(
+                    "vme_yawrate_noise", self.vme_yawrate_noise
+                )
+            )
+            self.reg_information_cap_on = config_args["tracker"].get(
+                "reg_information_cap_on", self.reg_information_cap_on
+            )
+            self.degeneracy_lever_arm_m = float(
+                config_args["tracker"].get(
+                    "degeneracy_lever_arm_m", self.degeneracy_lever_arm_m
+                )
+            )
+            self.reg_position_sigma_m = float(
+                config_args["tracker"].get(
+                    "reg_position_sigma_m", self.reg_position_sigma_m
+                )
+            )
+            self.vme_scale_on = config_args["tracker"].get(
+                "vme_scale_on", self.vme_scale_on
+            )
+            self.vme_scale_random_walk = float(
+                config_args["tracker"].get(
+                    "vme_scale_random_walk", self.vme_scale_random_walk
+                )
+            )
+            self.vme_scale_init_sigma = float(
+                config_args["tracker"].get(
+                    "vme_scale_init_sigma", self.vme_scale_init_sigma
+                )
+            )
+            self.vme_scale_min = float(
+                config_args["tracker"].get("vme_scale_min", self.vme_scale_min)
+            )
+            self.vme_scale_max = float(
+                config_args["tracker"].get("vme_scale_max", self.vme_scale_max)
+            )
+            self.vme_scale_min_speed_mps = float(
+                config_args["tracker"].get(
+                    "vme_scale_min_speed_mps", self.vme_scale_min_speed_mps
+                )
+            )
+            self.vme_scale_min_lidar_weight = float(
+                config_args["tracker"].get(
+                    "vme_scale_min_lidar_weight", self.vme_scale_min_lidar_weight
+                )
+            )
+            self.vme_scale_settle_frames = int(
+                config_args["tracker"].get(
+                    "vme_scale_settle_frames", self.vme_scale_settle_frames
+                )
+            )
+            self.vme_innovation_inflate_frames = int(
+                config_args["tracker"].get(
+                    "vme_innovation_inflate_frames",
+                    self.vme_innovation_inflate_frames,
+                )
+            )
+            self.vme_velocity_recovery_sigma_mps = float(
+                config_args["tracker"].get(
+                    "vme_velocity_recovery_sigma_mps",
+                    self.vme_velocity_recovery_sigma_mps,
+                )
+            )
+            if min(
+                self.vel_process_noise_mps_per_sqrt_s,
+                self.vme_vel_noise,
+                self.vme_nhc_noise,
+                self.vme_yawrate_noise,
+                self.degeneracy_lever_arm_m,
+                self.reg_position_sigma_m,
+                self.vme_scale_random_walk,
+                self.vme_scale_init_sigma,
+                self.vme_scale_min_speed_mps,
+                self.vme_velocity_recovery_sigma_mps,
+            ) <= 0.0:
+                raise ValueError("VME noise and adaptation parameters must be positive")
+            if not 0.0 <= self.vme_scale_min_lidar_weight <= 1.0:
+                raise ValueError("vme_scale_min_lidar_weight must be in [0, 1]")
+            if min(
+                self.vme_scale_settle_frames, self.vme_innovation_inflate_frames
+            ) < 1:
+                raise ValueError("VME frame thresholds must be at least one")
+            if not self.vme_scale_min < 1.0 < self.vme_scale_max:
+                raise ValueError("VME scale limits must satisfy min < 1 < max")
 
         # pgo
         if self.track_on:

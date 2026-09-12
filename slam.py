@@ -6,6 +6,7 @@
 # Junlong Jiang [jiangjunlong@mail.dlut.edu.cn]
 # Copyright (c) 2025 Junlong Jiang, all rights reserved.
 
+import csv
 import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -84,6 +85,33 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
     iekfom = IEKFOM(config, neural_points, geo_mlp)
     dataset.tracker = iekfom
 
+    diagnostic_fields = [
+        "frame_index", "lidar_timestamp", "source_point_count",
+        "valid_sdf_point_count", "valid_point_ratio", "sdf_residual_median",
+        "sdf_residual_rmse", "sdf_residual_q90", "optimizer_converged",
+        "optimizer_iteration_count", "prediction_lidar_translation_m",
+        "prediction_lidar_rotation_deg",
+        *[f"information_eigenvalue_{index}" for index in range(6)],
+        *[f"lidar_weight_{index}" for index in range(6)],
+        "lidar_longitudinal_weight", "degeneracy_lambda_min_abs",
+        "lidar_information_capped_fraction",
+        "information_condition_number", "imu_predicted_translation_m",
+        "imu_predicted_rotation_deg", "imu_predicted_body_long_mps",
+        "vme_body_long_mps", "post_vme_body_long_mps",
+        "final_body_long_mps", "vme_scale", "vme_scale_sigma",
+        "vme_innovation_mps", "vme_innovation_sigma_mps", "vme_nis",
+        "velocity_sigma_long_mps", "vme_scale_frozen",
+        "covariance_inflation_active", "vme_scale_saturated",
+        "lidar_body_longitudinal_displacement_m",
+        "vme_longitudinal_displacement_m", "vme_yaw_change_deg",
+        "final_pose_source", "rejection_reason", "inserted_into_neural_map",
+    ]
+    diagnostic_file = open(
+        os.path.join(run_path, "tracking_diagnostics.csv"), "w", newline=""
+    )
+    diagnostic_writer = csv.DictWriter(diagnostic_file, fieldnames=diagnostic_fields)
+    diagnostic_writer.writeheader()
+
     # 建图模块
     mapper = Mapper(config, dataset, neural_points, local_point_cloud_map, geo_mlp)
 
@@ -148,6 +176,14 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
 
         T2 = get_time()
 
+        predicted_pose = np.eye(4)
+        predicted_pose[:3, :3] = iekfom.x.rot.cpu().numpy()
+        predicted_pose[:3, 3] = iekfom.x.pos.cpu().numpy()
+        predicted_relative = np.linalg.inv(dataset.last_pose_ref) @ predicted_pose
+        predicted_rotation_deg = np.degrees(
+            np.arccos(np.clip((np.trace(predicted_relative[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))
+        )
+
         # II. 里程计定位
         if frame_id > 0:
             if config.track_on:
@@ -172,6 +208,7 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
         if not dataset.lose_track and valid_mapping_flag:
             mapper.process_frame(
                 dataset.cur_point_cloud_torch,
+                dataset.cur_point_origin_torch,
                 dataset.cur_sem_labels_torch,
                 dataset.cur_pose_torch,
                 frame_id,
@@ -182,6 +219,43 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
             neural_points.reset_local_map(
                 dataset.cur_pose_torch[:3, 3], None, frame_id
             )  # not efficient for large map
+
+        registration_diagnostics = (
+            iekfom.last_registration_diagnostics if frame_id > 0 else {}
+        )
+        diagnostic_writer.writerow(
+            {
+                "frame_index": frame_id,
+                "lidar_timestamp": dataset.poses_ts[frame_id],
+                **registration_diagnostics,
+                "imu_predicted_translation_m": (
+                    float(np.linalg.norm(predicted_relative[:3, 3]))
+                    if frame_id > 0 else float("nan")
+                ),
+                "imu_predicted_rotation_deg": (
+                    predicted_rotation_deg if frame_id > 0 else float("nan")
+                ),
+                "imu_predicted_body_long_mps": dataset.vme_predicted_long_mps,
+                "vme_body_long_mps": (
+                    None if dataset.cur_vme is None else dataset.cur_vme["v_long_mps"]
+                ),
+                "post_vme_body_long_mps": dataset.vme_post_update_long_mps,
+                "final_body_long_mps": float(
+                    (iekfom.x.rot.cpu().T @ iekfom.x.vel.cpu())[0]
+                ),
+                "vme_scale": float(iekfom.x.vme_scale.cpu()),
+                "vme_scale_sigma": float(torch.sqrt(iekfom.P[18, 18].cpu())),
+                "lidar_body_longitudinal_displacement_m": (
+                    float(dataset.last_odom_tran[0, 3]) if frame_id > 0 else None
+                ),
+                "final_pose_source": "lidar" if frame_id > 0 else "initial",
+                "rejection_reason": registration_diagnostics.get(
+                    "rejection_reason", ""
+                ),
+                "inserted_into_neural_map": bool(valid_mapping_flag),
+            }
+        )
+        diagnostic_file.flush()
 
         T4 = get_time()
 
@@ -395,6 +469,7 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
 
     # V. 保存结果
     mapper.free_pool()
+    diagnostic_file.close()
     pose_eval_results = dataset.write_results()
 
     neural_points.prune_map(

@@ -99,7 +99,10 @@ class SLAMDataset(Dataset):
                 self.poses_ts = np.genfromtxt(
                     self.config.pose_ts_path, delimiter=",", skip_header=1, dtype=float
                 )
-                if len(self.poses_ts) != self.total_pc_count_in_folder:
+                self.poses_ts = np.atleast_1d(self.poses_ts)[
+                    config.begin_frame : config.end_frame : config.step_frame
+                ]
+                if len(self.poses_ts) != self.total_pc_count:
                     print(
                         "poses timestamp length: {}, total point cloud count: {}".format(
                             len(self.poses_ts), self.total_pc_count
@@ -175,6 +178,9 @@ class SLAMDataset(Dataset):
         # count the consecutive stop frame of the robot
         self.stop_count: int = 0
         self.stop_status = False
+        self.cur_vme = None
+        self.vme_predicted_long_mps = None
+        self.vme_post_update_long_mps = None
 
         if self.config.kitti_correction_on:
             self.last_odom_tran[0, 3] = (
@@ -195,7 +201,10 @@ class SLAMDataset(Dataset):
 
         # current frame's data
         self.cur_point_cloud_torch = None
+        self.cur_point_origin_torch = None
         self.cur_point_ts_torch = None
+        self.corrected_frame_point_cloud_torch = None
+        self.corrected_frame_point_ts_torch = None
         self.cur_sem_labels_torch = None
         self.cur_sem_labels_full = None
 
@@ -223,6 +232,7 @@ class SLAMDataset(Dataset):
         self.cur_point_cloud_torch = torch.tensor(
             points, device=self.device, dtype=self.dtype
         )
+        self.cur_point_origin_torch = torch.zeros_like(self.cur_point_cloud_torch[:, :3])
 
         if self.config.deskew:
             self.get_point_ts(point_ts)
@@ -242,6 +252,7 @@ class SLAMDataset(Dataset):
         self.cur_point_cloud_torch = torch.tensor(
             points, device=self.device, dtype=self.dtype
         )
+        self.cur_point_origin_torch = torch.zeros_like(self.cur_point_cloud_torch[:, :3])
 
         if self.config.deskew:
             self.get_point_ts(point_ts)
@@ -254,8 +265,8 @@ class SLAMDataset(Dataset):
         # load point cloud (support *pcd, *ply and kitti *bin format)
         pc_filename = os.path.join(self.config.pc_path, self.pc_filenames[frame_id])
         if not self.config.semantic_on:
-            point_cloud, point_ts = read_point_cloud(
-                pc_filename, self.config.color_channel
+            point_cloud, point_ts, point_origins = read_point_cloud(
+                pc_filename, self.config.color_channel, return_origins=True
             )
             # print(point_ts)
             # [N, 3], [N, 4] or [N, 6], may contain color or intensity # here read as numpy array
@@ -278,15 +289,22 @@ class SLAMDataset(Dataset):
             self.cur_sem_labels_full = torch.tensor(
                 sem_labels, device=self.device, dtype=torch.int
             )  # full labels (>20 classes)
+            point_origins = np.zeros((len(point_cloud), 3), dtype=point_cloud.dtype)
 
         # 初始化得到点云张量
         cur_point_cloud_torch = torch.tensor(
             point_cloud, device=self.device, dtype=self.dtype
         )
+        cur_point_origin_torch = torch.tensor(
+            point_origins, device=self.device, dtype=self.dtype
+        )
 
         # 将点云从LiDAR系转到IMU系
         self.cur_point_cloud_torch = transform_torch(
             cur_point_cloud_torch[:, :3], self.config.T_imu_lidar
+        )
+        self.cur_point_origin_torch = transform_torch(
+            cur_point_origin_torch, self.config.T_imu_lidar
         )
 
         # 运动畸变校正
@@ -368,6 +386,10 @@ class SLAMDataset(Dataset):
         # T1 = get_time()
         # poses related
         frame_id = self.processed_frame
+        self.cur_vme = self.read_vme_frame(frame_id)
+        self.vme_predicted_long_mps = None
+        self.vme_post_update_long_mps = None
+        cur_pose_init_guess = self.cur_pose_ref
         if frame_id == 0:  # initialize the first frame, no tracking yet
             if self.config.track_on:
                 self.odom_poses[frame_id] = self.cur_pose_ref
@@ -375,8 +397,22 @@ class SLAMDataset(Dataset):
                 self.pgo_poses[frame_id] = self.cur_pose_ref
             self.travel_dist[frame_id] = 0.0
             self.last_pose_ref = self.cur_pose_ref
+            initial_vme = self.cur_vme
+            if initial_vme is None and self.config.vme_on:
+                for future_frame in range(1, self.total_pc_count):
+                    initial_vme = self.read_vme_frame(future_frame)
+                    if initial_vme is not None:
+                        break
+            if initial_vme is not None and self.tracker is not None:
+                body_vel = torch.tensor(
+                    [initial_vme["v_long_mps"], 0.0, 0.0],
+                    dtype=self.config.tran_dtype,
+                )
+                self.tracker.x.vel = self.tracker.x.rot @ body_vel
 
         elif frame_id > 0:
+            if self.cur_vme is None:
+                self.tracker.mark_vme_missing()
             imu_path = os.path.join(
                 self.config.imu_path, "{}.csv".format(self.processed_frame)
             )
@@ -385,6 +421,15 @@ class SLAMDataset(Dataset):
                 dt = data[0]  # 时间变化量
                 i_in = InputIkfom(self.config.tran_dtype, data[1:4], data[4:7])
                 self.tracker.predict(i_in, dt)
+
+            predicted_body_vel = self.tracker.x.rot.T @ self.tracker.x.vel
+            self.vme_predicted_long_mps = float(predicted_body_vel[0])
+            if self.cur_vme is not None:
+                self.tracker.update_vme(
+                    self.cur_vme["v_long_mps"], self.cur_vme.get("yaw_rate_rps")
+                )
+                updated_body_vel = self.tracker.x.rot.T @ self.tracker.x.vel
+                self.vme_post_update_long_mps = float(updated_body_vel[0])
 
             cur_pose_init_guess = np.eye(4)
             cur_pose_init_guess[:3, :3] = self.tracker.x.rot.cpu().numpy()
@@ -421,6 +466,28 @@ class SLAMDataset(Dataset):
                 self.pgo_poses[frame_id] = cur_pose_init_guess
             return False
 
+        if self.config.corrected_frame_dir:
+            export_points = self.cur_point_cloud_torch.clone()
+            export_ts = (
+                None
+                if self.cur_point_ts_torch is None
+                else self.cur_point_ts_torch.clone()
+            )
+            export_points, export_ts = crop_frame(
+                export_points,
+                export_ts,
+                self.config.min_z,
+                self.config.max_z,
+                self.config.min_range,
+                crop_max_range,
+            )
+            if self.config.kitti_correction_on:
+                export_points = intrinsic_correct(
+                    export_points, self.config.correction_deg
+                )
+            self.corrected_frame_point_cloud_torch = export_points
+            self.corrected_frame_point_ts_torch = export_ts
+
         # 降采样
         if self.config.rand_downsample:
             kept_count = int(original_count * self.config.rand_down_r)
@@ -430,6 +497,7 @@ class SLAMDataset(Dataset):
                 self.cur_point_cloud_torch[:, :3], train_voxel_m
             )
         self.cur_point_cloud_torch = self.cur_point_cloud_torch[idx]
+        self.cur_point_origin_torch = self.cur_point_origin_torch[idx]
 
         if self.cur_point_ts_torch is not None:
             self.cur_point_ts_torch = self.cur_point_ts_torch[idx]
@@ -442,6 +510,9 @@ class SLAMDataset(Dataset):
         # 预处理：对点云进行过滤
         if self.cur_sem_labels_torch is not None:
             # 语义过滤
+            semantic_mask = self.cur_sem_labels_full > 1
+            if self.config.filter_moving_object:
+                semantic_mask &= self.cur_sem_labels_full < 100
             self.cur_point_cloud_torch, self.cur_sem_labels_torch = filter_sem_kitti(
                 self.cur_point_cloud_torch,
                 self.cur_sem_labels_torch,
@@ -449,16 +520,24 @@ class SLAMDataset(Dataset):
                 True,
                 self.config.filter_moving_object,
             )
+            self.cur_point_origin_torch = self.cur_point_origin_torch[semantic_mask]
         else:
             # 裁剪点云
-            self.cur_point_cloud_torch, self.cur_point_ts_torch = crop_frame(
+            (
+                self.cur_point_cloud_torch,
+                self.cur_point_ts_torch,
+                crop_mask,
+            ) = crop_frame(
                 self.cur_point_cloud_torch,
                 self.cur_point_ts_torch,
                 self.config.min_z,  # 最小高度
                 self.config.max_z,  # 最大高度
                 self.config.min_range,  # 最小距离
                 crop_max_range,
+                origins=self.cur_point_origin_torch,
+                return_mask=True,
             )
+            self.cur_point_origin_torch = self.cur_point_origin_torch[crop_mask]
 
         if self.config.kitti_correction_on:
             self.cur_point_cloud_torch = intrinsic_correct(
@@ -494,12 +573,81 @@ class SLAMDataset(Dataset):
                     torch.tensor(
                         self.last_odom_tran, device=self.device, dtype=self.dtype
                     ),
+                    normalize_ts=not self.config.valid_ts_in_points,
                 )  # T_last<-cur
 
             # print("# Source point for registeration : ", cur_source_torch.shape[0])
 
         # T4 = get_time()
         return True
+
+    def read_vme_frame(self, frame_id):
+        """Read one valid per-frame VME row using canonical names plus benign aliases."""
+        if not self.config.vme_on or not self.config.vme_path:
+            return None
+        vme_file = os.path.join(self.config.vme_path, f"{frame_id}.csv")
+        if not os.path.isfile(vme_file):
+            return None
+
+        def normalized(name):
+            return "".join(character for character in name.lower() if character.isalnum())
+
+        aliases = {
+            "v_long_mps": {
+                "vlongmps",
+                "vlong",
+                "longitudinalvelocity",
+                "longitudinalvelocitymps",
+                "velocitylongitudinal",
+            },
+            "v_lat_mps": {
+                "vlatmps",
+                "vlat",
+                "lateralvelocity",
+                "lateralvelocitymps",
+                "velocitylateral",
+            },
+            "yaw_rate_rps": {
+                "yawraterps",
+                "yawrate",
+                "yawraterads",
+                "yawrateradps",
+                "omegaz",
+            },
+            "valid": {"valid", "isvalid", "validity"},
+            "timestamp": {"timestamp", "time", "ts"},
+        }
+        try:
+            with open(vme_file, newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                row = next(reader, None)
+            if row is None:
+                return None
+            normalized_row = {
+                normalized(key): value for key, value in row.items() if key
+            }
+
+            def value_for(field):
+                for alias in aliases[field]:
+                    if alias in normalized_row:
+                        return normalized_row[alias]
+                return None
+
+            valid_value = value_for("valid")
+            valid = str(valid_value).strip().lower() in {"1", "true", "yes", "y"}
+            v_long = float(value_for("v_long_mps"))
+            if not valid or not np.isfinite(v_long):
+                return None
+            result = {"v_long_mps": v_long}
+            for field in ("v_lat_mps", "yaw_rate_rps", "timestamp"):
+                raw_value = value_for(field)
+                if raw_value not in (None, ""):
+                    parsed_value = float(raw_value)
+                    if np.isfinite(parsed_value):
+                        result[field] = parsed_value
+            return result
+        except (OSError, TypeError, ValueError):
+            return None
 
     def update_odom_pose(self, cur_pose_torch: torch.tensor):
         cur_frame_id = self.processed_frame
@@ -515,10 +663,13 @@ class SLAMDataset(Dataset):
 
         self.last_odom_tran = inv(self.last_pose_ref) @ self.cur_pose_ref  # T_last<-cur
 
-        # 检查变换矩阵是否接近单位矩阵，判断机器人是否处于停止状态
-        if tranmat_close_to_identity(
-            self.last_odom_tran, 1e-3, self.config.voxel_size_m * 0.1
-        ):
+        if self.cur_vme is not None:
+            stopped_this_frame = abs(self.cur_vme["v_long_mps"]) < 0.02
+        else:
+            stopped_this_frame = tranmat_close_to_identity(
+                self.last_odom_tran, 1e-3, self.config.voxel_size_m * 0.1
+            )
+        if stopped_this_frame:
             self.stop_count += 1
         else:
             self.stop_count = 0
@@ -562,7 +713,23 @@ class SLAMDataset(Dataset):
                 self.cur_point_cloud_torch,
                 self.cur_point_ts_torch,
                 torch.tensor(self.last_odom_tran, device=self.device, dtype=self.dtype),
+                normalize_ts=not self.config.valid_ts_in_points,
             )  # T_last<-cur
+            self.cur_point_origin_torch = deskewing(
+                self.cur_point_origin_torch,
+                self.cur_point_ts_torch,
+                torch.tensor(self.last_odom_tran, device=self.device, dtype=self.dtype),
+                normalize_ts=not self.config.valid_ts_in_points,
+            )
+            if self.corrected_frame_point_cloud_torch is not None:
+                self.corrected_frame_point_cloud_torch = deskewing(
+                    self.corrected_frame_point_cloud_torch,
+                    self.corrected_frame_point_ts_torch,
+                    torch.tensor(
+                        self.last_odom_tran, device=self.device, dtype=self.dtype
+                    ),
+                    normalize_ts=not self.config.valid_ts_in_points,
+                )
 
         # 处理连续跟踪丢失的情况
         if self.lose_track:
@@ -910,6 +1077,7 @@ class SLAMDataset(Dataset):
                     torch.tensor(
                         tran_in_frame, device=self.device, dtype=torch.float64
                     ),
+                    normalize_ts=not self.config.valid_ts_in_points,
                 )  # T_last<-cur
 
             down_vox_m = self.config.vox_down_m
@@ -983,8 +1151,11 @@ class SLAMDataset(Dataset):
 
 
 def read_point_cloud(
-    filename: str, color_channel: int = 0, bin_channel_count: int = 4
-) -> np.ndarray:
+    filename: str,
+    color_channel: int = 0,
+    bin_channel_count: int = 4,
+    return_origins: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None] | tuple[np.ndarray, np.ndarray | None, np.ndarray]:
     # read point cloud from either (*.ply, *.pcd, *.las) or (kitti *.bin) format
     if ".bin" in filename:
         is_nclt_bin = False  # FIXME
@@ -1002,11 +1173,19 @@ def read_point_cloud(
         ts = None
         if bin_channel_count == 6:
             ts = points[:, -1]
+        origins = np.zeros((len(points), 3), dtype=points.dtype)
 
     elif ".ply" in filename:
         vertex = PlyData.read(filename)["vertex"].data
         properties = set(vertex.dtype.names or ())
         points = np.column_stack((vertex["x"], vertex["y"], vertex["z"]))
+        origin_properties = {"origin_x", "origin_y", "origin_z"}
+        if origin_properties <= properties:
+            origins = np.column_stack(
+                (vertex["origin_x"], vertex["origin_y"], vertex["origin_z"])
+            )
+        else:
+            origins = np.zeros((len(points), 3), dtype=points.dtype)
 
         if "t" in properties:
             ts = np.asarray(vertex["t"]) * 1e-8
@@ -1030,6 +1209,7 @@ def read_point_cloud(
 
         pc_load = o3d.io.read_point_cloud(filename)
         points = np.asarray(pc_load.points, dtype=np.float64)
+        origins = np.zeros((len(points), 3), dtype=points.dtype)
         ts = None
     elif ".las" in filename:  # use laspy
         import laspy
@@ -1045,6 +1225,7 @@ def read_point_cloud(
                 # print(intensity)
                 points = np.hstack((points, intensity))
             ts = None  # TODO, also read the point-wise timestamp for las point cloud
+            origins = np.zeros((len(points), 3), dtype=points.dtype)
     else:
         sys.exit(
             "The format of the imported point cloud is wrong (support only *pcd, *ply, *las and *bin)"
@@ -1052,7 +1233,9 @@ def read_point_cloud(
 
     # print("Loaded ", np.shape(points)[0], " points")
 
-    return points, ts  # as np
+    if return_origins:
+        return points, ts, origins
+    return points, ts
 
 
 # now we only support semantic kitti format dataset
@@ -1229,6 +1412,8 @@ def crop_frame(
     max_z_th=100.0,
     min_range=2.75,
     max_range=100.0,
+    origins=None,
+    return_mask=False,
 ):
     """
     对点云数据进行过滤，根据点的距离和高度条件选出有效的点。
@@ -1239,7 +1424,8 @@ def crop_frame(
     min_range: 点到原点的最小距离，默认为 2.75
     max_range: 点到原点的最大距离，默认为 100.0
     """
-    dist = torch.norm(points[:, :3], dim=1)
+    ray_vectors = points[:, :3] if origins is None else points[:, :3] - origins
+    dist = torch.norm(ray_vectors, dim=1)
     filtered_idx = (
         (dist > min_range)
         & (dist < max_range)
@@ -1249,6 +1435,8 @@ def crop_frame(
     points = points[filtered_idx]
     if ts is not None:
         ts = ts[filtered_idx]
+    if return_mask:
+        return points, ts, filtered_idx
     return points, ts
 
 

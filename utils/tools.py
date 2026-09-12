@@ -201,6 +201,33 @@ def remove_gpu_cache():
         torch.cuda.empty_cache()
 
 
+def write_binary_xyz_pcd(path: Path, points: np.ndarray):
+    """Write an N-by-3 point array as a binary XYZ PCD file."""
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+
+    points = np.ascontiguousarray(points, dtype="<f4")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = (
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
+        f"WIDTH {len(points)}\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"POINTS {len(points)}\n"
+        "DATA binary\n"
+    ).encode("ascii")
+    with path.open("wb") as pcd_file:
+        pcd_file.write(header)
+        pcd_file.write(points.tobytes())
+
+
 def setup_optimizer(
     config: Config,
     neural_point_feat,
@@ -804,7 +831,11 @@ def split_chunks(pc, aabb, chunk_m: float = 100.0):
 
 # torch version of lidar undistortion (deskewing)
 def deskewing(
-    points: torch.tensor, ts: torch.tensor, pose: torch.tensor, ts_mid_pose=0.5
+    points: torch.tensor,
+    ts: torch.tensor,
+    pose: torch.tensor,
+    ts_mid_pose=0.5,
+    normalize_ts=True,
 ):
     """
     Deskew a batch of points at timestamp ts by a relative transformation matrix
@@ -816,15 +847,18 @@ def deskewing(
     # ts is from 0 to 1 as the ratio
     ts = ts.squeeze(-1)
 
-    # Normalize the tensor to the range [0, 1]
-    # NOTE: you need to figure out the begin and end of a frame because
-    # sometimes there's only partial measurements, some part are blocked by some occlussions
     min_ts = torch.min(ts)
     max_ts = torch.max(ts)
-    ts = (ts - min_ts) / (max_ts - min_ts)
+    if max_ts == min_ts:
+        return points
+
+    # Inferred timestamps may cover only part of a scan and retain the legacy
+    # per-input normalization. Valid timestamps already encode the scan phase.
+    if normalize_ts:
+        ts = (ts - min_ts) / (max_ts - min_ts)
 
     # this is related to: https://github.com/PRBonn/kiss-icp/issues/299
-    ts -= ts_mid_pose
+    ts = ts - ts_mid_pose
 
     rotmat_slerp = roma.rotmat_slerp(
         torch.eye(3).to(points), pose[:3, :3].to(points), ts
