@@ -159,19 +159,67 @@ def estimate_plane(
 
     def fit_planes(points: torch.Tensor):
         """Fits multiple planes using SVD"""
+        if points.shape[0] == 0:
+            return (
+                points.new_empty((0, 3)),
+                points.new_empty((0, 3)),
+                points.new_empty((0, 3)),
+            )
         centroid = points.mean(dim=1, keepdim=True)
         centered_points = points - centroid
-        U, S, Vh = torch.linalg.svd(
-            centered_points, full_matrices=False
-        )  # Perform SVD.
+        covariance = centered_points.transpose(1, 2) @ centered_points
+        covariance = 0.5 * (covariance + covariance.transpose(1, 2))
+        scale = covariance.abs().amax(dim=(1, 2))
+        nonzero = scale > 0
+        scaled = covariance / torch.where(nonzero, scale, torch.ones_like(scale))[:, None, None]
 
-        # The normal vector of the plane is the last row of Vh (since Vh is the transpose of V).
-        normals = Vh[:, -1, :]
-        return normals, centroid.squeeze(1), S
+        diagonal = scaled.diagonal(dim1=1, dim2=2)
+        q = diagonal.mean(dim=1)
+        centered = scaled - torch.diag_embed(q[:, None].expand(-1, 3))
+        p = torch.sqrt((centered.square().sum(dim=(1, 2))) / 6.0)
+        regular = p > torch.finfo(points.dtype).eps
+        safe_p = torch.where(regular, p, torch.ones_like(p))
+        b = centered / safe_p[:, None, None]
+        determinant = (
+            b[:, 0, 0] * (b[:, 1, 1] * b[:, 2, 2] - b[:, 1, 2] * b[:, 2, 1])
+            - b[:, 0, 1] * (b[:, 1, 0] * b[:, 2, 2] - b[:, 1, 2] * b[:, 2, 0])
+            + b[:, 0, 2] * (b[:, 1, 0] * b[:, 2, 1] - b[:, 1, 1] * b[:, 2, 0])
+        )
+        r = determinant.mul(0.5).clamp(-1.0, 1.0)
+        phi = torch.acos(r) / 3.0
+        eig_max = q + 2.0 * p * torch.cos(phi)
+        eig_min = q + 2.0 * p * torch.cos(phi + 2.0 * math.pi / 3.0)
+        eig_mid = 3.0 * q - eig_max - eig_min
+        eigenvalues = torch.stack((eig_min, eig_mid, eig_max), dim=1)
+        eigenvalues = torch.where(regular[:, None], eigenvalues, diagonal)
+        eigenvalues = eigenvalues * scale[:, None]
+
+        shifted = scaled - torch.diag_embed(eig_min[:, None].expand(-1, 3))
+        candidates = torch.stack(
+            (
+                torch.linalg.cross(shifted[:, 0], shifted[:, 1]),
+                torch.linalg.cross(shifted[:, 0], shifted[:, 2]),
+                torch.linalg.cross(shifted[:, 1], shifted[:, 2]),
+            ),
+            dim=1,
+        )
+        candidate_norms = candidates.square().sum(dim=2)
+        best = candidate_norms.argmax(dim=1)
+        normals = candidates[torch.arange(points.shape[0], device=points.device), best]
+        normal_norm = normals.norm(dim=1, keepdim=True)
+        fallback = torch.zeros_like(normals)
+        fallback[:, 0] = 1.0
+        normals = torch.where(
+            (regular & (normal_norm[:, 0] > torch.finfo(points.dtype).eps))[:, None],
+            normals / normal_norm.clamp_min(torch.finfo(points.dtype).eps),
+            fallback,
+        )
+        singular_values = torch.sqrt(torch.clamp(eigenvalues, min=0))
+        return normals, centroid.squeeze(1), singular_values
 
     def is_valid_planes(singular_values: torch.Tensor, eta_threshold: float):
         """Determines whether the fitted planes are valid based on the η value."""
-        lambda_min = singular_values[:, -1]  # The smallest singular value.
+        lambda_min = singular_values[:, 0]  # The smallest singular value.
         lambda_mid = singular_values[:, 1]  # The middle singular value.
 
         eta = lambda_min / (lambda_mid + 1e-6)

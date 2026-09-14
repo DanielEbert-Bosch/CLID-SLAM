@@ -131,8 +131,8 @@ class InputIkfom:
 
     def __init__(self, dtype, acc: np.array, gyro: np.array):
         self.dtype = dtype
-        self.acc = torch.tensor(acc, dtype=self.dtype)
-        self.gyro = torch.tensor(gyro, dtype=self.dtype)
+        self.acc = torch.as_tensor(acc, dtype=self.dtype)
+        self.gyro = torch.as_tensor(gyro, dtype=self.dtype)
 
 
 def boxplus(state: StateIkfom, delta: torch.tensor):
@@ -206,6 +206,7 @@ class IEKFOM:
         self.vme_scale_adaptation_allowed = False
         self.vme_diagnostics = self._empty_vme_diagnostics()
         self.last_registration_diagnostics = {}
+        self.collect_diagnostics = False
 
     def _empty_vme_diagnostics(self):
         return {
@@ -453,7 +454,7 @@ class IEKFOM:
         min_grad_norm = self.config.reg_min_grad_norm
         max_grad_norm = self.config.reg_max_grad_norm
 
-        T = torch.eye(4)
+        T = torch.eye(4, device=pc_imu.device, dtype=pc_imu.dtype)
         T[:3, :3] = self.x.rot
         T[:3, 3] = self.x.pos
 
@@ -461,11 +462,12 @@ class IEKFOM:
         sample_count = pc_map.shape[0]
         iter_n = math.ceil(sample_count / bs)
 
-        sdf_pred = torch.zeros(sample_count, device=pc_map.device)
-        sdf_std = torch.zeros(sample_count, device=pc_map.device)
-        mc_mask = torch.zeros(sample_count, device=pc_map.device, dtype=torch.bool)
-        sdf_grad = torch.zeros((sample_count, 3), device=pc_map.device)
-        certainty = torch.zeros(sample_count, device=pc_map.device)
+        if iter_n > 1:
+            sdf_pred = torch.zeros(sample_count, device=pc_map.device)
+            sdf_std = torch.zeros(sample_count, device=pc_map.device)
+            mc_mask = torch.zeros(sample_count, device=pc_map.device, dtype=torch.bool)
+            sdf_grad = torch.zeros((sample_count, 3), device=pc_map.device)
+            certainty = torch.zeros(sample_count, device=pc_map.device)
 
         # 分批处理，计算点云的SDF预测值
         for n in range(iter_n):
@@ -496,13 +498,23 @@ class IEKFOM:
                 )
                 batch_sdf_std = torch.sqrt(torch.clamp(batch_sdf_var, min=0.0)).squeeze(1)
                 batch_sdf = batch_sdf_mean.squeeze(1)
-                sdf_std[head:tail] = batch_sdf_std.detach()
+                if iter_n > 1:
+                    sdf_std[head:tail] = batch_sdf_std.detach()
+            elif iter_n == 1:
+                batch_sdf_std = torch.zeros_like(batch_sdf)
 
-            batch_sdf_grad = get_gradient(batch_coord, batch_sdf)
-            sdf_grad[head:tail, :] = batch_sdf_grad.detach()
-            sdf_pred[head:tail] = batch_sdf.detach()
-            mc_mask[head:tail] = nn_count >= mask_min_nn_count
-            certainty[head:tail] = batch_certainty.detach()
+            batch_sdf_grad = get_gradient(batch_coord, batch_sdf, create_graph=False)
+            if iter_n == 1:
+                sdf_pred = batch_sdf.detach()
+                sdf_std = batch_sdf_std.detach()
+                mc_mask = nn_count >= mask_min_nn_count
+                sdf_grad = batch_sdf_grad.detach()
+                certainty = batch_certainty.detach()
+            else:
+                sdf_grad[head:tail, :] = batch_sdf_grad.detach()
+                sdf_pred[head:tail] = batch_sdf.detach()
+                mc_mask[head:tail] = nn_count >= mask_min_nn_count
+                certainty[head:tail] = batch_certainty.detach()
 
         # 剔除异常观测
         grad_norm = sdf_grad.norm(dim=-1, keepdim=True).squeeze()
@@ -524,7 +536,7 @@ class IEKFOM:
         H = torch.zeros((N, STATE_DIM), device=self.device, dtype=self.tran_dtype)
         pc_imu_hat = batch_vec2skew(pc_imu)
         rotation = self.x.rot.to(dtype=self.dtype).unsqueeze(0)
-        A = torch.bmm(rotation.repeat(N, 1, 1), pc_imu_hat)
+        A = torch.matmul(rotation, pc_imu_hat)
         H[:, 0:3] = -torch.bmm(sdf_grad.unsqueeze(1), A).squeeze(1)
         H[:, 3:6] = sdf_grad
 
@@ -577,7 +589,7 @@ class IEKFOM:
                 valid_flag = False
                 rejection_reason = "not_enough_valid_points"
 
-            S, b, _, _, _ = _shape_lidar_normal_equations(
+            S, b, normalized_eigenvalues, eigenvectors, lidar_weights = _shape_lidar_normal_equations(
                 H,
                 self.R_inv,
                 z,
@@ -596,11 +608,12 @@ class IEKFOM:
             rot_angle_deg = dx_[0:3].norm() * 180.0 / np.pi
 
             # 第一种迭代终止判定方式（有物理含义）
-            if (
-                rot_angle_deg < term_thre_deg
-                and tran_m < term_thre_m
-                and torch.all(torch.abs(dx_[6:]) < self.eps)
-            ):
+            convergence_test = (
+                (rot_angle_deg < term_thre_deg)
+                & (tran_m < term_thre_m)
+                & torch.all(torch.abs(dx_[6:]) < self.eps)
+            )
+            if convergence_test.item():
                 if not self.config.silence:
                     print("Converged after", i, "iterations")
                 converged = True
@@ -622,55 +635,23 @@ class IEKFOM:
         z_final = final_linearized_residual
         H_final = final_H
         valid_points_final = final_valid_points
-        pose_information = (H_final[:, :6].T * self.R_inv) @ H_final[:, :6]
-        information_eigenvalues = torch.linalg.eigvalsh(pose_information)
-        _, _, normalized_eigenvalues, eigenvectors, lidar_weights = (
-            _shape_lidar_normal_equations(
-                H_final,
-                self.R_inv,
-                z_final,
-                self.config.degeneracy_lever_arm_m,
-                self.config.reg_position_sigma_m,
-                self.config.reg_information_cap_on,
-            )
-        )
         longitudinal_direction = torch.zeros(
             6, dtype=self.tran_dtype, device=self.device
         )
         longitudinal_direction[3:6] = x_propagated.rot[:, 0]
         direction_coefficients = eigenvectors.T @ longitudinal_direction
         direction_norm = torch.dot(direction_coefficients, direction_coefficients)
-        longitudinal_weight = 0.0
-        if direction_norm > 0.0:
-            lambda_ref = 1.0 / self.config.reg_position_sigma_m**2
-            capped_eigenvalues = normalized_eigenvalues * lidar_weights
-            longitudinal_weight = float(
+        lambda_ref = 1.0 / self.config.reg_position_sigma_m**2
+        capped_eigenvalues = normalized_eigenvalues * lidar_weights
+        longitudinal_weight = float(
+            torch.where(
+                direction_norm > 0.0,
                 torch.dot(direction_coefficients.square(), capped_eigenvalues)
-                / (direction_norm * lambda_ref)
-            )
-        longitudinal_weight = min(max(longitudinal_weight, 0.0), 1.0)
+                / (direction_norm * lambda_ref),
+                torch.zeros_like(direction_norm),
+            ).clamp(0.0, 1.0)
+        )
         self.previous_lidar_longitudinal_weight = longitudinal_weight
-        information_sum = torch.sum(normalized_eigenvalues)
-        capped_fraction = 0.0
-        if information_sum > 0.0:
-            capped_fraction = float(
-                torch.sum(normalized_eigenvalues * (1.0 - lidar_weights))
-                / information_sum
-            )
-        condition_number = float("inf")
-        if information_eigenvalues[0] > 0:
-            condition_number = float(
-                information_eigenvalues[-1] / information_eigenvalues[0]
-            )
-        correction = boxminus(self.x, x_propagated)
-        residual_abs = torch.abs(z_final)
-        residual_median = float("nan")
-        residual_rmse = float("nan")
-        residual_q90 = float("nan")
-        if residual_abs.numel():
-            residual_median = float(torch.median(residual_abs))
-            residual_rmse = float(torch.sqrt(torch.mean(z_final**2)))
-            residual_q90 = float(torch.quantile(residual_abs, 0.9))
         source_point_count = int(pc_imu.shape[0])
         valid_point_count = int(valid_points_final.shape[0])
         self.last_registration_diagnostics = {
@@ -679,30 +660,69 @@ class IEKFOM:
             "valid_point_ratio": (
                 valid_point_count / source_point_count if source_point_count else 0.0
             ),
-            "sdf_residual_median": residual_median,
-            "sdf_residual_rmse": residual_rmse,
-            "sdf_residual_q90": residual_q90,
             "optimizer_converged": converged,
             "optimizer_iteration_count": iteration_count,
-            "prediction_lidar_translation_m": float(correction[3:6].norm()),
-            "prediction_lidar_rotation_deg": float(
-                correction[0:3].norm() * 180.0 / np.pi
-            ),
-            **{
-                f"information_eigenvalue_{index}": float(value)
-                for index, value in enumerate(information_eigenvalues)
-            },
-            **{
-                f"lidar_weight_{index}": float(value)
-                for index, value in enumerate(lidar_weights)
-            },
             "lidar_longitudinal_weight": longitudinal_weight,
-            "lidar_information_capped_fraction": capped_fraction,
-            "degeneracy_lambda_min_abs": float(normalized_eigenvalues[0]),
-            "information_condition_number": condition_number,
             "rejection_reason": rejection_reason,
             **self.vme_diagnostics,
         }
+        if self.collect_diagnostics:
+            pose_information = (H_final[:, :6].T * self.R_inv) @ H_final[:, :6]
+            information_eigenvalues = torch.linalg.eigvalsh(pose_information)
+            correction = boxminus(self.x, x_propagated)
+            residual_abs = torch.abs(z_final)
+            information_sum = torch.sum(normalized_eigenvalues)
+            diagnostic_values = torch.cat(
+                (
+                    torch.stack(
+                        (
+                            torch.median(residual_abs),
+                            torch.sqrt(torch.mean(z_final**2)),
+                            torch.quantile(residual_abs, 0.9),
+                            correction[3:6].norm(),
+                            correction[0:3].norm() * 180.0 / np.pi,
+                        )
+                    ),
+                    information_eigenvalues,
+                    lidar_weights,
+                    torch.stack(
+                        (
+                            torch.where(
+                                information_sum > 0.0,
+                                torch.sum(normalized_eigenvalues * (1.0 - lidar_weights))
+                                / information_sum,
+                                torch.zeros_like(information_sum),
+                            ),
+                            normalized_eigenvalues[0],
+                            torch.where(
+                                information_eigenvalues[0] > 0.0,
+                                information_eigenvalues[-1] / information_eigenvalues[0],
+                                torch.full_like(information_eigenvalues[0], float("inf")),
+                            ),
+                        )
+                    ),
+                )
+            ).cpu().tolist()
+            self.last_registration_diagnostics.update(
+                {
+                    "sdf_residual_median": diagnostic_values[0],
+                    "sdf_residual_rmse": diagnostic_values[1],
+                    "sdf_residual_q90": diagnostic_values[2],
+                    "prediction_lidar_translation_m": diagnostic_values[3],
+                    "prediction_lidar_rotation_deg": diagnostic_values[4],
+                    **{
+                        f"information_eigenvalue_{index}": diagnostic_values[5 + index]
+                        for index in range(6)
+                    },
+                    **{
+                        f"lidar_weight_{index}": diagnostic_values[11 + index]
+                        for index in range(6)
+                    },
+                    "lidar_information_capped_fraction": diagnostic_values[17],
+                    "degeneracy_lambda_min_abs": diagnostic_values[18],
+                    "information_condition_number": diagnostic_values[19],
+                }
+            )
         updated_pose = torch.eye(4, dtype=self.dtype, device=self.device)
         updated_pose[:3, :3] = self.x.rot.to(self.dtype)
         updated_pose[:3, 3] = self.x.pos.to(self.dtype)

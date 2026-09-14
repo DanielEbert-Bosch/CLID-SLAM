@@ -3,6 +3,7 @@
 # @author    Yue Pan     [yue.pan@igg.uni-bonn.de]
 # Copyright (c) 2024 Yue Pan, all rights reserved
 import getpass
+import inspect
 import json
 import multiprocessing
 import os
@@ -274,7 +275,20 @@ def setup_optimizer(
     }
     opt_setting.append(feat_opt_dict)
     if config.opt_adam:
-        opt = optim.Adam(opt_setting, betas=(0.9, 0.99), eps=config.adam_eps)
+        for group in opt_setting:
+            group["params"] = list(group["params"])
+        adam_parameters = inspect.signature(optim.Adam).parameters
+        all_params = [param for group in opt_setting for param in group["params"]]
+        adam_options = {}
+        if "fused" in adam_parameters and all(
+            param.is_cuda and param.dtype == torch.float32 for param in all_params
+        ):
+            adam_options["fused"] = True
+        elif "foreach" in adam_parameters:
+            adam_options["foreach"] = True
+        opt = optim.Adam(
+            opt_setting, betas=(0.9, 0.99), eps=config.adam_eps, **adam_options
+        )
     else:
         opt = optim.SGD(opt_setting, momentum=0.9)
 
@@ -321,7 +335,7 @@ def step_lr_decay(
     return learning_rate
 
 
-def get_gradient(inputs, outputs):
+def get_gradient(inputs, outputs, create_graph=True):
     """
     Calculate the analytical gradient by pytorch auto diff
     """
@@ -330,8 +344,8 @@ def get_gradient(inputs, outputs):
         outputs=outputs,
         inputs=inputs,
         grad_outputs=d_points,
-        create_graph=True,
-        retain_graph=True,
+        create_graph=create_graph,
+        retain_graph=create_graph,
         only_inputs=True,
     )[0]
     return points_grad
@@ -836,6 +850,8 @@ def deskewing(
     pose: torch.tensor,
     ts_mid_pose=0.5,
     normalize_ts=True,
+    motion=None,
+    return_motion=False,
 ):
     """
     Deskew a batch of points at timestamp ts by a relative transformation matrix
@@ -845,33 +861,34 @@ def deskewing(
 
     # pose as T_last<-cur
     # ts is from 0 to 1 as the ratio
-    ts = ts.squeeze(-1)
+    if motion is None:
+        ts = ts.squeeze(-1)
+        min_ts = torch.min(ts)
+        max_ts = torch.max(ts)
+        if (max_ts == min_ts).item():
+            return (points, None) if return_motion else points
 
-    min_ts = torch.min(ts)
-    max_ts = torch.max(ts)
-    if max_ts == min_ts:
-        return points
+        # Inferred timestamps may cover only part of a scan and retain the legacy
+        # per-input normalization. Valid timestamps already encode the scan phase.
+        if normalize_ts:
+            ts = (ts - min_ts) / (max_ts - min_ts)
 
-    # Inferred timestamps may cover only part of a scan and retain the legacy
-    # per-input normalization. Valid timestamps already encode the scan phase.
-    if normalize_ts:
-        ts = (ts - min_ts) / (max_ts - min_ts)
-
-    # this is related to: https://github.com/PRBonn/kiss-icp/issues/299
-    ts = ts - ts_mid_pose
-
-    rotmat_slerp = roma.rotmat_slerp(
-        torch.eye(3).to(points), pose[:3, :3].to(points), ts
-    )
-
-    tran_lerp = ts[:, None] * pose[:3, 3].to(points)
+        # this is related to: https://github.com/PRBonn/kiss-icp/issues/299
+        ts = ts - ts_mid_pose
+        rotmat_slerp = roma.rotmat_slerp(
+            torch.eye(3, device=points.device, dtype=points.dtype), pose[:3, :3], ts
+        )
+        tran_lerp = ts[:, None] * pose[:3, 3]
+        motion = (rotmat_slerp, tran_lerp)
+    else:
+        rotmat_slerp, tran_lerp = motion
 
     points_deskewd = points
     points_deskewd[:, :3] = (rotmat_slerp @ points[:, :3].unsqueeze(-1)).squeeze(
         -1
     ) + tran_lerp
 
-    return points_deskewd
+    return (points_deskewd, motion) if return_motion else points_deskewd
 
 
 def tranmat_close_to_identity(mats: np.ndarray, rot_thre: float, tran_thre: float):

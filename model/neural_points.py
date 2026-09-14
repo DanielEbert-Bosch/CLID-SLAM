@@ -534,6 +534,7 @@ class NeuralPoints(nn.Module):
         global2local = torch.full_like(local_mask, -1, dtype=torch.long)
 
         local_indices = torch.nonzero(local_mask).flatten()
+        self.local_global_indices = local_indices
         local_point_count = local_indices.size(0)
         global2local[local_indices] = torch.arange(
             local_point_count, device=self.device
@@ -552,14 +553,17 @@ class NeuralPoints(nn.Module):
         """
         assign the local map to the global map
         """
-        local_mask = self.local_mask
-        # self.neural_points[local_mask[:-1]] = self.local_neural_points
-        # self.point_orientations[local_mask[:-1]] = self.local_point_orientations
-        self.geo_features[local_mask] = self.local_geo_features.data
+        feature_indices = self.local_global_indices
+        point_indices = feature_indices[:-1]
+        self.geo_features.index_copy_(0, feature_indices, self.local_geo_features.data)
         if self.color_features is not None:
-            self.color_features[local_mask] = self.local_color_features.data
-        self.point_certainties[local_mask[:-1]] = self.local_point_certainties
-        self.point_ts_update[local_mask[:-1]] = self.local_point_ts_update
+            self.color_features.index_copy_(
+                0, feature_indices, self.local_color_features.data
+            )
+        self.point_certainties.index_copy_(
+            0, point_indices, self.local_point_certainties
+        )
+        self.point_ts_update.index_copy_(0, point_indices, self.local_point_ts_update)
 
         # print("mean certainty for the neural points:", torch.mean(self.point_certainties))
 
@@ -584,8 +588,6 @@ class NeuralPoints(nn.Module):
         """
         if not query_geo_feature and not query_color_feature:
             sys.exit("you need to at least query one kind of feature")
-
-        batch_size = query_points.shape[0]
 
         geo_features_vector = None
         color_features_vector = None
@@ -617,45 +619,31 @@ class NeuralPoints(nn.Module):
         # T1 = get_time()
 
         dists2[idx == -1] = 9e3  # invalid, set to large distance
-        sorted_dist2, sorted_neigh_idx = torch.sort(
-            dists2, dim=1
-        )  # sort according to distance
-        sorted_idx = idx.gather(1, sorted_neigh_idx)
-        dists2 = sorted_dist2[:, :nn_k]  # only take the knn
-        idx = sorted_idx[:, :nn_k]  # sorted local idx, only take the knn
+        dists2, neigh_idx = torch.topk(
+            dists2,
+            k=min(nn_k, dists2.shape[1]),
+            dim=1,
+            largest=False,
+            sorted=True,
+        )
+        idx = idx.gather(1, neigh_idx)
 
         # dist2, idx are all with the shape [N, K]
 
         # T2 = get_time()
 
         valid_mask = idx >= 0  # [N, K]
+        safe_idx = idx.clamp_min(0)
+        valid_mask_f = valid_mask.unsqueeze(-1).to(self.dtype)
 
         if query_geo_feature:
-            geo_features = torch.zeros(
-                batch_size,
-                nn_k,
-                self.geo_feature_dim,
-                device=self.device,
-                dtype=self.dtype,
-            )  # [N, K, F]
-            if query_locally:
-                geo_features[valid_mask] = self.local_geo_features[idx[valid_mask]]
-            else:
-                geo_features[valid_mask] = self.geo_features[idx[valid_mask]]
+            table = self.local_geo_features if query_locally else self.geo_features
+            geo_features = table[safe_idx] * valid_mask_f
             if self.config.layer_norm_on:
                 geo_features = F.layer_norm(geo_features, [self.geo_feature_dim])
         if query_color_feature and self.color_features is not None:
-            color_features = torch.zeros(
-                batch_size,
-                nn_k,
-                self.color_feature_dim,
-                device=self.device,
-                dtype=self.dtype,
-            )  # [N, K, F]
-            if query_locally:
-                color_features[valid_mask] = self.local_color_features[idx[valid_mask]]
-            else:
-                color_features[valid_mask] = self.color_features[idx[valid_mask]]
+            table = self.local_color_features if query_locally else self.color_features
+            color_features = table[safe_idx] * valid_mask_f
             if self.config.layer_norm_on:
                 color_features = F.layer_norm(color_features, [self.color_feature_dim])
 
@@ -664,17 +652,19 @@ class NeuralPoints(nn.Module):
         # print(self.local_point_certainties)
 
         if query_locally:
-            certainty = self.local_point_certainties[idx]  # [N, K]
+            certainty = self.local_point_certainties[safe_idx]  # [N, K]
             neighb_vector = (
-                query_points.view(-1, 1, 3) - self.local_neural_points[idx]
+                query_points.view(-1, 1, 3) - self.local_neural_points[safe_idx]
             )  # [N, K, 3]
-            quat = self.local_point_orientations[idx]  # [N, K, 4]
+            if self.after_pgo:
+                quat = self.local_point_orientations[safe_idx]  # [N, K, 4]
         else:
-            certainty = self.point_certainties[idx]  # [N, K]
+            certainty = self.point_certainties[safe_idx]  # [N, K]
             neighb_vector = (
-                query_points.view(-1, 1, 3) - self.neural_points[idx]
+                query_points.view(-1, 1, 3) - self.neural_points[safe_idx]
             )  # [N, K, 3]
-            quat = self.point_orientations[idx]  # [N, K, 4]
+            if self.after_pgo:
+                quat = self.point_orientations[safe_idx]  # [N, K, 4]
 
         # quat[...,1:] *= -1. # inverse (not needed)
         # This has been doubly checked
@@ -682,9 +672,7 @@ class NeuralPoints(nn.Module):
             neighb_vector = apply_quaternion_rotation(
                 quat, neighb_vector
             )  # [N, K, 3] # passive rotation (axis rotation w.r.t point)
-        neighb_vector[~valid_mask] = torch.zeros(
-            1, 3, device=self.device, dtype=self.dtype
-        )
+        neighb_vector.mul_(valid_mask_f)
 
         if self.config.pos_encoding_band > 0:
             neighb_vector = self.position_encoder_geo(neighb_vector)  # [N, K, P]
@@ -704,7 +692,7 @@ class NeuralPoints(nn.Module):
             dists2 + eps
         )  # [N, K] # Inverse distance weighting (IDW), distance square
 
-        weight_vector[~valid_mask] = 0.0  # pad for invalid voxels
+        weight_vector.masked_fill_(~valid_mask, 0.0)  # pad for invalid voxels
         weight_vector[nn_counts == 0] = (
             eps  # all 0 would cause NaN during normalization
         )
@@ -716,25 +704,24 @@ class NeuralPoints(nn.Module):
         )  # [N, K] # normalize the weight, to make the sum as 1
 
         # print(weight_vector)
-        weight_vector[~valid_mask] = 0.0  # invalid has zero weight
+        weight_vector.masked_fill_(~valid_mask, 0.0)  # invalid has zero weight
 
         with torch.no_grad():
             # Certainty accumulation for each neural point according to the weight
             # Use scatter_add_ to accumulate the values for each index
             if training_mode:  # only do it during the training mode
-                idx[~valid_mask] = 0  # scatter_add don't accept -1 index
                 if query_locally:
                     self.local_point_certainties.scatter_add_(
-                        dim=0, index=idx.flatten(), src=weight_vector.flatten()
+                        dim=0, index=safe_idx.flatten(), src=weight_vector.flatten()
                     )
                     if (
                         query_ts is not None
                     ):  # update the last update ts for each neural point
-                        idx_ts = query_ts.view(-1, 1).repeat(1, K)
-                        idx_ts[~valid_mask] = 0
+                        idx_ts = query_ts.view(-1, 1).expand(-1, K)
+                        idx_ts = idx_ts.masked_fill(~valid_mask, 0)
                         self.local_point_ts_update.scatter_reduce_(
                             dim=0,
-                            index=idx.flatten(),
+                            index=safe_idx.flatten(),
                             src=idx_ts.flatten(),
                             reduce="amax",
                             include_self=True,
@@ -742,16 +729,12 @@ class NeuralPoints(nn.Module):
                         # print(self.local_point_ts_update)
                 else:
                     self.point_certainties.scatter_add_(
-                        dim=0, index=idx.flatten(), src=weight_vector.flatten()
+                        dim=0, index=safe_idx.flatten(), src=weight_vector.flatten()
                     )
                 # queried_certainty = None
 
-                certainty[~valid_mask] = 0.0
-                queried_certainty = torch.sum(certainty * weight_vector, dim=1)
-
-            else:  # inference mode
-                certainty[~valid_mask] = 0.0
-                queried_certainty = torch.sum(certainty * weight_vector, dim=1)
+            certainty.masked_fill_(~valid_mask, 0.0)
+            queried_certainty = torch.sum(certainty * weight_vector, dim=1)
 
         weight_vector = weight_vector.unsqueeze(-1)  # [N, K, 1]
 

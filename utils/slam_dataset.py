@@ -12,10 +12,10 @@ import sys
 import torch
 import matplotlib.cm as cm
 import numpy as np
-import pandas as pd
 from plyfile import PlyData
 from numpy.linalg import inv
 from pathlib import Path
+from scipy.spatial.transform import Rotation
 from typing import List
 from rich import print
 from torch.utils.data import Dataset
@@ -416,7 +416,8 @@ class SLAMDataset(Dataset):
             imu_path = os.path.join(
                 self.config.imu_path, "{}.csv".format(self.processed_frame)
             )
-            imu_period = pd.read_csv(imu_path, delimiter=",", skiprows=1).values
+            imu_period = np.loadtxt(imu_path, delimiter=",", skiprows=2, ndmin=2)
+            imu_period = torch.as_tensor(imu_period, dtype=self.config.tran_dtype)
             for data in imu_period:
                 dt = data[0]  # 时间变化量
                 i_in = InputIkfom(self.config.tran_dtype, data[1:4], data[4:7])
@@ -709,25 +710,28 @@ class SLAMDataset(Dataset):
         # deskewing (motion undistortion using the estimated transformation) for the sampled points for mapping
         # 应用去畸变处理，修正由于机器人运动导致的点云畸变，需要细化
         if self.config.deskew and not self.lose_track:
-            self.cur_point_cloud_torch = deskewing(
+            odom_tran_torch = torch.as_tensor(
+                self.last_odom_tran, device=self.device, dtype=self.dtype
+            )
+            self.cur_point_cloud_torch, deskew_motion = deskewing(
                 self.cur_point_cloud_torch,
                 self.cur_point_ts_torch,
-                torch.tensor(self.last_odom_tran, device=self.device, dtype=self.dtype),
+                odom_tran_torch,
                 normalize_ts=not self.config.valid_ts_in_points,
+                return_motion=True,
             )  # T_last<-cur
             self.cur_point_origin_torch = deskewing(
                 self.cur_point_origin_torch,
                 self.cur_point_ts_torch,
-                torch.tensor(self.last_odom_tran, device=self.device, dtype=self.dtype),
+                odom_tran_torch,
                 normalize_ts=not self.config.valid_ts_in_points,
+                motion=deskew_motion,
             )
             if self.corrected_frame_point_cloud_torch is not None:
                 self.corrected_frame_point_cloud_torch = deskewing(
                     self.corrected_frame_point_cloud_torch,
                     self.corrected_frame_point_ts_torch,
-                    torch.tensor(
-                        self.last_odom_tran, device=self.device, dtype=self.dtype
-                    ),
+                    odom_tran_torch,
                     normalize_ts=not self.config.valid_ts_in_points,
                 )
 
@@ -882,11 +886,12 @@ class SLAMDataset(Dataset):
         np.savetxt(
             os.path.join(self.run_path, "mean_time.txt"), mean_process_time, fmt="%.6f"
         )  # 使用6位小数的格式保存
-        plot_timing_detail(
-            time_table,
-            os.path.join(self.run_path, "time_details.png"),
-            self.config.pgo_on,
-        )
+        if os.environ.get("CLID_PLOT_TIMING") == "1":
+            plot_timing_detail(
+                time_table,
+                os.path.join(self.run_path, "time_details.png"),
+                self.config.pgo_on,
+            )
 
         pose_eval = None
 
@@ -1379,18 +1384,15 @@ def write_kitti_format_poses(filename: str, poses_np: np.ndarray):
 def write_tum_format_poses(
     filename: str, poses_np: np.ndarray, timestamps=None, frame_s=0.1
 ):
-    from pyquaternion import Quaternion
-
     frame_count = poses_np.shape[0]
     tum_out = np.empty((frame_count, 8))
-    for i in range(frame_count):
-        tx, ty, tz = poses_np[i, :3, -1].flatten()
-        qw, qx, qy, qz = Quaternion(matrix=poses_np[i], atol=0.01).elements
-        if timestamps is None:
-            ts = i * frame_s
-        else:
-            ts = float(timestamps[i])
-        tum_out[i] = np.array([ts, tx, ty, tz, qx, qy, qz, qw])
+    tum_out[:, 0] = (
+        np.arange(frame_count) * frame_s
+        if timestamps is None
+        else np.asarray(timestamps[:frame_count], dtype=float)
+    )
+    tum_out[:, 1:4] = poses_np[:, :3, 3]
+    tum_out[:, 4:8] = Rotation.from_matrix(poses_np[:, :3, :3]).as_quat()
 
     np.savetxt(fname=f"{filename}_tum.txt", X=tum_out, fmt="%.4f")
 

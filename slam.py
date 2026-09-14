@@ -163,7 +163,10 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
     cur_mesh = None
     cur_sdf_slice = None
 
+    frame_wall_times = []
+    loop_wall_start = time.perf_counter()
     for frame_id in tqdm(range(dataset.total_pc_count)):
+        frame_wall_start = time.perf_counter()
         # I. 加载数据和预处理
         T0 = get_time()
         dataset.read_frame(frame_id)
@@ -172,6 +175,7 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
         valid_frame = dataset.preprocess_frame()
         if not valid_frame:
             dataset.processed_frame += 1
+            frame_wall_times.append(time.perf_counter() - frame_wall_start)
             continue
 
         T2 = get_time()
@@ -274,15 +278,18 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
 
         # mapping with fixed poses (every frame)
         if frame_id % config.mapping_freq_frame == 0:
-            mapper.mapping(cur_iter_num)
+            try:
+                mapper.mapping(cur_iter_num)
+            except torch.cuda.OutOfMemoryError:
+                print("[bold yellow](Warning) CUDA OOM during mapping; clearing cache and retrying once[/bold yellow]")
+                remove_gpu_cache()
+                mapper.mapping(cur_iter_num)
 
         T5 = get_time()
 
         # regular saving logs
         if config.log_freq_frame > 0 and (frame_id + 1) % config.log_freq_frame == 0:
             dataset.write_results_log()
-
-        remove_gpu_cache()
 
         # IV: 网格重建和可视化
         if config.o3d_vis_on:
@@ -466,6 +473,22 @@ def run_slam(config_path=None, dataset_name=None, sequence_name=None, seed=None)
             wandb.log(wandb_log_content)
 
         dataset.processed_frame += 1
+
+        frame_wall_times.append(time.perf_counter() - frame_wall_start)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    loop_wall_time = time.perf_counter() - loop_wall_start
+    steady_state_times = frame_wall_times[20:100]
+    mean_ms = loop_wall_time / len(frame_wall_times) * 1e3
+    steady_state_mean_ms = (
+        np.mean(steady_state_times) * 1e3 if steady_state_times else float("nan")
+    )
+    print(
+        f"Frame timing: total frames={len(frame_wall_times)}, "
+        f"total loop time={loop_wall_time:.3f}s, mean={mean_ms:.3f}ms/frame, "
+        f"steady-state (frames 20..99)={steady_state_mean_ms:.3f}ms/frame"
+    )
 
     # V. 保存结果
     mapper.free_pool()

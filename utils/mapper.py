@@ -79,6 +79,8 @@ class Mapper:
         self.new_idx = None
         self.ba_done_flag = False
         self.adaptive_iter_offset = 0
+        self._numerical_gradient_offsets = None
+        self._numerical_gradient_offset_key = None
 
         # data pool
         self.coord_pool = torch.empty((0, 3), device=self.device, dtype=self.dtype)
@@ -659,18 +661,13 @@ class Mapper:
 
         for iter in tqdm(range(iter_count), disable=self.silence):
             # load batch data (avoid using dataloader because the data are already in gpu, memory vs speed)
-            T00 = get_time()
             # we do not use the ray rendering loss here for the incremental mapping
             coord, sdf_label, ts, _, sem_label, color_label, weight = self.get_batch(
                 global_coord=not self.ba_done_flag
             )  # coord here is in global frame if no ba pose update
 
-            T01 = get_time()
-
-            poses = self.used_poses[ts]
-            origins = poses[:, :3, 3]
-
             if self.ba_done_flag:
+                poses = self.used_poses[ts]
                 coord = transform_batch_torch(
                     coord, poses
                 )  # transformed to global frame
@@ -688,7 +685,6 @@ class Mapper:
                 coord, ts, query_color_feature=self.config.color_on
             )
 
-            T02 = get_time()
             # predict the scaled sdf with the feature
 
             sdf_pred = self.geo_mlp.sdf(
@@ -706,10 +702,6 @@ class Mapper:
                 if not self.config.weighted_first:
                     color_pred = torch.sum(color_pred * weight_knn, dim=1)  # N, C
 
-            surface_mask = (
-                torch.abs(sdf_label) < self.config.surface_sample_range_m
-            )  # weight > 0
-
             if self.require_gradient:
                 g = get_gradient(coord, sdf_pred)  # to unit m
             elif (
@@ -726,9 +718,8 @@ class Mapper:
                 #                                 self.config.voxel_size_m*self.config.num_grad_step_ratio*2)
                 # different eps for different sample points (smaller for those more stable ones)
 
-            T03 = get_time()
-
             if self.config.proj_correction_on:  # [not used]
+                origins = self.used_poses[ts, :3, 3]
                 cos = torch.abs(F.cosine_similarity(g, coord - origins))
                 sdf_label = sdf_label * cos
 
@@ -798,6 +789,9 @@ class Mapper:
             if (
                 self.config.ekional_loss_on and self.config.weight_e > 0
             ):  # MSE with regards to 1
+                surface_mask = (
+                    torch.abs(sdf_label) < self.config.surface_sample_range_m
+                )
                 surface_mask_decimated = surface_mask[
                     :: self.config.gradient_decimation
                 ]
@@ -838,6 +832,9 @@ class Mapper:
             # optional color (intensity) loss
             color_loss = 0.0
             if self.config.color_on and self.config.weight_i > 0:
+                surface_mask = (
+                    torch.abs(sdf_label) < self.config.surface_sample_range_m
+                )
                 color_loss = color_diff_loss(
                     color_pred[surface_mask],
                     color_label[surface_mask],
@@ -847,22 +844,11 @@ class Mapper:
                 )
                 cur_loss += self.config.weight_i * color_loss
 
-            T04 = get_time()
-
             opt.zero_grad(set_to_none=True)
             cur_loss.backward(retain_graph=False)
             opt.step()
 
-            T05 = get_time()
-
             self.total_iter += 1
-
-            # in ms
-            # print("time for get data        :", (T01-T00) * 1e3) # \
-            # print("time for feature querying:", (T02-T01) * 1e3) # \\\\\\\
-            # print("time for sdf prediction  :", (T03-T02) * 1e3) # \\\\\\
-            # print("time for loss calculation:", (T04-T03) * 1e3) # \\
-            # print("time for back propogation:", (T05-T04) * 1e3) # \\\\\\
 
             if self.config.wandb_vis_on:
                 import wandb
@@ -1005,19 +991,26 @@ class Mapper:
     def get_numerical_gradient(self, x, sdf_x=None, eps=0.02, two_side=True):
         N = x.shape[0]
 
-        eps_x = torch.tensor([eps, 0.0, 0.0], dtype=x.dtype, device=x.device)  # [3]
-        eps_y = torch.tensor([0.0, eps, 0.0], dtype=x.dtype, device=x.device)  # [3]
-        eps_z = torch.tensor([0.0, 0.0, eps], dtype=x.dtype, device=x.device)  # [3]
+        offset_key = (x.device, x.dtype, eps)
+        if self._numerical_gradient_offset_key != offset_key:
+            self._numerical_gradient_offsets = torch.tensor(
+                [
+                    [eps, 0.0, 0.0],
+                    [-eps, 0.0, 0.0],
+                    [0.0, eps, 0.0],
+                    [0.0, -eps, 0.0],
+                    [0.0, 0.0, eps],
+                    [0.0, 0.0, -eps],
+                ],
+                dtype=x.dtype,
+                device=x.device,
+            ).unsqueeze(1)
+            self._numerical_gradient_offset_key = offset_key
 
         if two_side:
-            x_pos = x + eps_x
-            x_neg = x - eps_x
-            y_pos = x + eps_y
-            y_neg = x - eps_y
-            z_pos = x + eps_z
-            z_neg = x - eps_z
-
-            x_posneg = torch.concat((x_pos, x_neg, y_pos, y_neg, z_pos, z_neg), dim=0)
+            x_posneg = (x.unsqueeze(0) + self._numerical_gradient_offsets).reshape(
+                6 * N, 3
+            )
             sdf_x_posneg = self.sdf(x_posneg)[0].unsqueeze(-1)
 
             sdf_x_pos = sdf_x_posneg[:N]
@@ -1032,11 +1025,9 @@ class Mapper:
             gradient_z = (sdf_z_pos - sdf_z_neg) / (2 * eps)
 
         else:
-            x_pos = x + eps_x
-            y_pos = x + eps_y
-            z_pos = x + eps_z
-
-            x_all = torch.concat((x_pos, y_pos, z_pos), dim=0)
+            x_all = (
+                x.unsqueeze(0) + self._numerical_gradient_offsets[::2]
+            ).reshape(3 * N, 3)
             sdf_x_all = self.sdf(x_all)[0].unsqueeze(-1)
 
             sdf_x = sdf_x.unsqueeze(-1)
